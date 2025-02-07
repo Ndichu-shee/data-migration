@@ -30,20 +30,23 @@ class Grantee:
             "Authorization": f"Bearer {self._bearer_token}",
             "Content-Type": "application/json",
         }
+        self.get_grantees_endpoint = os.getenv("GET_CONTACTS_ENDPOINT").format(
+            self.foundation_id
+        )
 
     def _read_csv(self):
         """
-        read the grantees csv and return the dict of each row
+        Read the grantees CSV and return a list of dictionaries for each row.
         """
         if self.dry_run:
-            self.logger.info(f"Dry run step: The First step is to read the csv")
+            self.logger.info("Dry run: Reading CSV file.")
         with open(self.file_path, mode="r") as file:
             reader = csv.DictReader(file)
             return [row for row in reader], reader.fieldnames
 
     def _write_csv(self, data, fieldnames):
         """
-        add the non profit id value back to the csv, this is help when update non profit data
+        Add the nonprofit ID value back to the CSV. This helps when updating nonprofit data.
         """
         with open(self.file_path, mode="w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -64,23 +67,41 @@ class Grantee:
                 requests.exceptions.ConnectionError,
                 requests.exceptions.RequestException,
             ) as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
+                self.logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 if attempt < retries - 1:
                     time.sleep(delay)
                 else:
                     raise
         return None
 
+    def _get_nonprofits(self):
+        """Fetches existing nonprofit IDs from the API."""
+        if self.dry_run:
+            self.logger.info(
+                f"Dry run step: get the list of the existing non profits- then get the affinity id"
+            )
+            return []
+        response = self._send_request_with_retry(
+            self.get_grantees_endpoint, self._headers, json={"pageSize": 10000}
+        )
+
+        if response:
+            nonprofits = []
+            response_data = response.json()
+            for item in response_data.get("searchResponse", {}).get("responses", []):
+                org_id = item.get("customFields", {}).get("Affinity ID-4jS8olxc")
+                nonprofits.append(org_id)
+            return nonprofits
+
     def _create_nonprofit(self, nonprofit_data):
         """
-        create each record, if the response is 200, append the org name to the sucessful response
-        else add the response text to the failed responses
+        Create a nonprofit record. If successful, append the organization name to the successful responses list.
+        Otherwise, log the failure.
         """
         if self.dry_run:
-            self.logger.info("Dry run: Would create nonprofit")
+            self.logger.info(f"Dry run: Would create nonprofit")
             return
         try:
-
             response = self._send_request_with_retry(
                 self.create_nonprofit_endpoint, self._headers, nonprofit_data
             )
@@ -102,7 +123,6 @@ class Grantee:
                     }
                 )
                 return None
-
         except Exception as e:
             self.logger.error(f"Error occurred during API call: {e}")
             self.failed_responses.append(
@@ -112,39 +132,45 @@ class Grantee:
 
     def process_csv(self):
         data, fieldnames = self._read_csv()
+        existing_temelio_grants = self._get_nonprofits()
         if "id" not in fieldnames:
             fieldnames.append("id")
         for row in data:
             required_fields = ["Name", "LIF Primary Lead Name"]
-
             missing_fields = [field for field in required_fields if not row.get(field)]
-
             if missing_fields:
+                self.logger.warning(f"Missing fields {missing_fields} for row {row}")
                 self.failed_responses.append(
-                    f"Missing fields: {', '.join(missing_fields)} for row: {row}"
+                    {
+                        "message": f"Missing fields: {', '.join(missing_fields)}",
+                        "row": row,
+                    }
                 )
                 row["id"] = "Failed"
                 continue
             """
-            map the csv data with the expected temelio fields
+            Map the CSV data to the expected Temelio fields.
             """
+            if row.get("Name") not in existing_temelio_grants:
+                self.logger.info(
+                    f"Non profit already exists in temelio..not creating one"
+                )
+                continue
             nonprofit_data = {
                 "legalName": row.get("Name"),
                 "primaryContactName": row.get("LIF Primary Lead Name"),
             }
-            # call temelio create non profit endpoint to create the non profit record
+            # Call Temelio create nonprofit endpoint to create the nonprofit record.
             nonprofit_id = self._create_nonprofit(nonprofit_data)
             row["id"] = nonprofit_id if nonprofit_id else "Failed"
-
         self._write_csv(data, fieldnames)
         if self.dry_run:
             self.logger.info(
-                "Dry run would count the successful and failed responses and print out the responses"
+                f"Dry run complete: {len(data)} total rows, {len(self.successful_responses)} successful, {len(self.failed_responses)} failed."
             )
             return
-
         self.logger.info(
-            f"Processing complete: {len(self.successful_responses)} success {self.successful_responses}, {len(self.failed_responses)} failed {self.failed_responses}."
+            f"Processing complete: {len(self.successful_responses)} success, {len(self.failed_responses)} failed."
         )
 
 
